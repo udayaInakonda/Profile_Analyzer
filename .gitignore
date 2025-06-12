@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.log
+Backend/venv/
+
+# React / Node
+Frontend/webapp/node_modules/
+Frontend/webapp/build/
+Frontend/webapp/dist/
+
+# Environment files
+.env
+.env.*
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Test output
+coverage/

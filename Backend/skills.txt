@@ -1,0 +1,75 @@
+python
+java
+javascript
+c++
+html
+css
+react
+node.js
+express
+fastapi
+django
+flask
+sql
+mysql
+postgresql
+mongodb
+git
+docker
+kubernetes
+linux
+aws
+azure
+gcp
+machine learning
+deep learning
+data analysis
+data science
+data visualization
+pandas
+numpy
+scikit-learn
+tensorflow
+pytorch
+natural language processing
+nlp
+computer vision
+problem solving
+communication
+teamwork
+leadership
+project management
+agile
+scrum
+jira
+time management
+critical thinking
+creativity
+presentation
+debugging
+testing
+unit testing
+ci/cd
+rest api
+graphql
+version control
+object oriented programming
+oop
+functional programming
+json
+xml
+bash
+shell scripting
+firebase
+firebase firestore
+firebase auth
+matplotlib
+seaborn
+excel
+power bi
+tableau
+statistics
+linear algebra
+networking
+security
+ethical hacking

@@ -3,17 +3,26 @@ from fastapi.responses import JSONResponse
 from sentence_transformers import SentenceTransformer
 from PyPDF2 import PdfReader
 import numpy as np
-from keybert import KeyBERT
-from transformers import pipeline
-import logging
-import re
+from transformers import pipeline # type: ignore
+from huggingface_hub import login
+import os
+from dotenv import load_dotenv  # <-- Add this import
 
 router = APIRouter()
 
+# Load environment variables from .env file
+load_dotenv("environment.env")  # <-- Load your env file
+
+# Call login once at module load
+hf_token = os.environ.get("HF_TOKEN")
+if hf_token:
+    login(hf_token)
+else:
+    raise RuntimeError("HuggingFace token not found in environment variable HF_TOKEN")
+
+# Singleton pattern for model loading to avoid reloading on every request
 _sentence_model = None
-_kw_model = None
-_flan_tokenizer = None
-_flan_model = None
+_gen_pipeline = None  # Add this for the text2text-generation pipeline
 
 def get_sentence_model():
     global _sentence_model
@@ -21,21 +30,14 @@ def get_sentence_model():
         _sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
     return _sentence_model
 
-def get_kw_model():
-    global _kw_model
-    if _kw_model is None:
-        _kw_model = KeyBERT(get_sentence_model())
-    return _kw_model
-
-def get_flan_model():
-    global _flan_tokenizer, _flan_model
-    if _flan_tokenizer is None or _flan_model is None:
-        model_name = "google/flan-t5-small"
-        _flan_tokenizer = AutoTokenizer.from_pretrained(model_name)
-        _flan_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-    return _flan_tokenizer, _flan_model
+def get_gen_pipeline():
+    global _gen_pipeline
+    if _gen_pipeline is None:
+        _gen_pipeline = pipeline("text2text-generation", model="MBZUAI/LaMini-Flan-T5-248M", temperature=0)
+    return _gen_pipeline
 
 def extract_text_from_pdf(file):
+    """Extracts all text from a PDF file."""
     reader = PdfReader(file)
     text = ""
     for page in reader.pages:
@@ -43,6 +45,7 @@ def extract_text_from_pdf(file):
     return text
 
 def compute_similarity(text1, text2):
+    """Computes cosine similarity between two texts using sentence embeddings."""
     model = get_sentence_model()
     emb1 = model.encode([text1])[0]
     emb2 = model.encode([text2])[0]
@@ -50,82 +53,44 @@ def compute_similarity(text1, text2):
     score = max(0, min(100, int(sim * 100)))
     return score
 
-def extract_skills_with_keybert(text: str, top_n=15) -> list:
-    kw_model = get_kw_model()
-    keywords = kw_model.extract_keywords(
-        text, keyphrase_ngram_range=(1, 2), stop_words='english', top_n=top_n
-    )
-    # Remove duplicates and keep only the keyword string
-    seen = set()
-    skills = []
-    for kw, _ in keywords:
-        kw_lower = kw.lower()
-        if kw_lower not in seen:
-            skills.append(kw_lower)
-            seen.add(kw_lower)
-    return skills
-
-def normalize_skills(skills):
-    # Split phrases into words, remove stopwords, and deduplicate
-    stopwords = {"in", "of", "and", "with", "for", "to", "the", "a", "an"}
-    normalized = set()
-    for skill in skills:
-        words = re.split(r'\W+', skill.lower())
-        for word in words:
-            if word and word not in stopwords:
-                normalized.add(word)
-    return normalized
-
-def generate_reason_with_flan(jd_skills, resume_skills, matched_skills, missing_skills, score):
-    prompt = (
-        f"You are analyzing how well a candidate’s skills match a job description.\n\n"
-        f"Job Description Skills: {', '.join(jd_skills[:8])}\n"
-        f"Resume Skills: {', '.join(resume_skills[:8])}\n"
-        f"Matched Skills: {', '.join(matched_skills[:8])}\n"
-        f"Missing Skills: {', '.join(missing_skills[:8])}\n"
-        f"Skill Match Score: {score} out of 100\n\n"
-        "Write a short, helpful summary for the candidate. "
-        "Explain why the score is high or low, highlight strengths, and give specific suggestions for improvement."
-    )
-    tokenizer, model = get_flan_model()
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=48,
-            do_sample=False,
-            use_cache=False
-        )
-    summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return summary.strip()
-
 @router.post("/analyze")
 async def analyze(jd_pdf: UploadFile = File(...), resume_pdf: UploadFile = File(...)):
+    # Basic similarity score between JD and resume
     jd_text = extract_text_from_pdf(jd_pdf.file)
     resume_text = extract_text_from_pdf(resume_pdf.file)
+    print(f"JD Text: {jd_text}...")
+    print(f"Resume Text: {resume_text}...")
     score = compute_similarity(jd_text, resume_text)
     return JSONResponse({"score": score})
 
+def get_match_level(score):
+    if score >= 75:
+        return "strong match"
+    elif score >= 50:
+        return "almost a match"
+    else:
+        return "not a match"
+
 @router.post("/insights")
 async def insights(jd_pdf: UploadFile = File(...), resume_pdf: UploadFile = File(...)):
+    # Extract text from PDFs
     jd_text = extract_text_from_pdf(jd_pdf.file)
     resume_text = extract_text_from_pdf(resume_pdf.file)
     score = compute_similarity(jd_text, resume_text)
-
-    jd_skills_raw = extract_skills_with_keybert(jd_text)
-    resume_skills_raw = extract_skills_with_keybert(resume_text)
-    jd_skills = normalize_skills(jd_skills_raw)
-    resume_skills = normalize_skills(resume_skills_raw)
-    matched_skills = sorted(list(jd_skills & resume_skills))
-    missing_skills = sorted(list(jd_skills - resume_skills))
-
-    reason = generate_reason_with_flan(
-        jd_skills_raw, resume_skills_raw, matched_skills, missing_skills, score
-    )
-
-    return JSONResponse({
-        "score": score,
-        "matched_skills": matched_skills,
-        "missing_skills": missing_skills,
-        "reason": reason
-    })
+    match_level = get_match_level(score)
+    # Use the singleton pipeline
+    gen = get_gen_pipeline()
+ 
+    prompt = f"""
+    You are a resume reviewer.
+    Based on the candidate's resume and the job description, write a short 2-3 sentence feedback (max 60 words) for the candidate.
+    Clearly say: this is a {match_level}. If skills are missing, mention up to 2 key ones that should be improved.
+    Job Description:
+    {jd_text}
+    Resume:
+    {resume_text}
+    Feedback:
+    """
+    # Generate feedback
+    output = gen(prompt, max_new_tokens=100, do_sample=False)[0]["generated_text"] # type: ignore
+    return JSONResponse({"score":score,"feedback": output})

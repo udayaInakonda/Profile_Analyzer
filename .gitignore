@@ -12,6 +12,7 @@ Frontend/webapp/dist/
 # Environment files
 .env
 .env.*
+Backend/environment.env
 
 # OS-specific
 .DS_Store

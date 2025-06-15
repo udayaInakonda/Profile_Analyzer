@@ -1,14 +1,16 @@
-from fastapi import APIRouter, File, UploadFile
+import faiss
+import pickle
+from fastapi import APIRouter, File, UploadFile, Body
 from fastapi.responses import JSONResponse
 from sentence_transformers import SentenceTransformer
 from PyPDF2 import PdfReader
 import numpy as np
 import mysql.connector
 import os
-import faiss
 from langchain.llms import HuggingFacePipeline
 from langchain.prompts import PromptTemplate
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+from pydantic import BaseModel
 
 router = APIRouter()
 model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -19,6 +21,11 @@ DB_CONFIG = {
     'password': 'Amzur@#123',
     'database': 'profile_analyzer'
 }
+
+# Define the absolute path to the FAISS index and metadata
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FAISS_INDEX_PATH = os.path.join(BASE_DIR, "Database", "resume_index.faiss")
+FAISS_META_PATH = os.path.join(BASE_DIR, "Database", "resume_metadata.pkl")
 
 def extract_text_from_pdf(file):
     reader = PdfReader(file)
@@ -83,6 +90,9 @@ async def analyze_db_bulk(jd_pdf: UploadFile = File(...)):
 
     return JSONResponse({"results": results})
 
+
+# Here on I use a small LLM for skill extraction
+
 def get_skill_extractor_llm():
     # Load a small LLM for skill extraction (adjust model as needed)
     model_name = "google/flan-t5-small"
@@ -106,66 +116,60 @@ def extract_skills_from_query(query):
     skills = [s.strip().lower() for s in result.split(",") if s.strip()]
     return set(skills)
 
-@router.post("/search_resumes")
-async def search_resumes(query: str):
-    # Extract relevant skills from the query using LLM
-    query_skills = extract_skills_from_query(query)
+@router.post("/search_resumes_cached")
+async def search_resumes_cached(query: str):
+    # Load FAISS index & metadata
+    index = faiss.read_index(FAISS_INDEX_PATH)
+    with open(FAISS_META_PATH, "rb") as f:
+        metadata = pickle.load(f)
 
-    # Connect to DB and fetch resume paths
-    conn = mysql.connector.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-    cursor.execute("SELECT resume_address, id FROM resume")
-    resume_rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
+    ids = metadata["ids"]
+    names = metadata["names"]
 
-    resume_texts = []
-    resume_names = []
-    resume_ids = []
-    for path, rid in resume_rows:
-        try:
-            with open(str(path), "rb") as f:
-                text = extract_text_from_pdf(f)
-            # Only consider resumes that mention at least one query skill
-            if any(skill in text.lower() for skill in query_skills):
-                resume_texts.append(text)
-                resume_names.append(os.path.basename(str(path)))
-                resume_ids.append(rid)
-        except Exception:
-            continue
-
-    # If no query_skills were extracted, fallback: consider all resumes
-    if not query_skills:
-        for path, rid in resume_rows:
-            try:
-                with open(str(path), "rb") as f:
-                    text = extract_text_from_pdf(f)
-                resume_texts.append(text)
-                resume_names.append(os.path.basename(str(path)))
-                resume_ids.append(rid)
-            except Exception:
-                continue
-
-    # If still no resumes, return at least the query skills
-    if not resume_texts:
-        return JSONResponse({"results": [], "querySkills": list(query_skills)})
-
-    # Compute embeddings for resumes
-    embeddings = model.encode(resume_texts, convert_to_numpy=True)
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
-    index.add(embeddings)
-
-    # Compute embedding for query
+    # Compute query embedding
+    top_k = min(2, len(ids))  # Only top 2 resumes
     query_emb = model.encode([query], convert_to_numpy=True)
-    D, I = index.search(query_emb, k=min(10, len(resume_texts)))  # Top 10 matches
+    D, I = index.search(query_emb, k=top_k)
 
     results = []
     for idx, score in zip(I[0], D[0]):
         results.append({
-            "resume_id": resume_ids[idx],
-            "resume_name": resume_names[idx],
-            "score": float(100 - score)  # Lower L2 means more similar; invert for score
+            "resume_id": ids[idx],
+            "resume_name": names[idx],
+            # "score": float(100 - score)
         })
 
-    return JSONResponse({"results": results, "querySkills": list(query_skills)})
+    return JSONResponse({"results": results})
+
+class ResumeSearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+@router.post("/search_existing_resumes")
+async def search_existing_resumes(request: ResumeSearchRequest = Body(...)):
+    """
+    Search existing resumes in the database using the FAISS index.
+    Returns the top_k most relevant resumes for the given query.
+    """
+    # Load FAISS index & metadata
+    index = faiss.read_index(FAISS_INDEX_PATH)
+    with open(FAISS_META_PATH, "rb") as f:
+        metadata = pickle.load(f)
+
+    ids = metadata["ids"]
+    names = metadata["names"]
+
+    # Compute query embedding
+    k = min(request.top_k, len(ids))
+    query_emb = model.encode([request.query], convert_to_numpy=True)
+    D, I = index.search(query_emb, k=k)
+
+    results = []
+    for idx, score in zip(I[0], D[0]):
+        results.append({
+            "resume_id": ids[idx],
+            "resume_name": names[idx],
+            # "score": float(100 - score)
+        })
+
+    return JSONResponse({"results": results})
